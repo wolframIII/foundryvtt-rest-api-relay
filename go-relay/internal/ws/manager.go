@@ -250,11 +250,6 @@ func (m *ClientManager) RemoveClient(id string) {
 
 	token := client.APIKey()
 
-	// Notify listeners (e.g., terminate interactive sessions)
-	if m.OnClientRemoved != nil {
-		m.OnClientRemoved(id, token)
-	}
-
 	// Clean up local state
 	delete(m.clients, id)
 	if group, ok := m.tokenGroups[token]; ok {
@@ -264,6 +259,14 @@ func (m *ClientManager) RemoveClient(id string) {
 		}
 	}
 	m.mu.Unlock()
+
+	// Notify listeners only after releasing the client-manager lock. Callbacks
+	// may acquire other locks and call back into the manager; invoking one here
+	// while holding m.mu can deadlock against code that holds those locks while
+	// reading the client manager.
+	if m.OnClientRemoved != nil {
+		m.OnClientRemoved(id, token)
+	}
 
 	// Close SSE connections on this instance and signal peer instances to do the same.
 	// This ensures SSE clients reconnect to the instance the module lands on next.
@@ -314,9 +317,6 @@ func (m *ClientManager) RemoveClientIfMatch(id string, expected *Client) {
 		return
 	}
 	token := client.APIKey()
-	if m.OnClientRemoved != nil {
-		m.OnClientRemoved(id, token)
-	}
 	delete(m.clients, id)
 	if group, ok := m.tokenGroups[token]; ok {
 		delete(group, id)
@@ -325,6 +325,10 @@ func (m *ClientManager) RemoveClientIfMatch(id string, expected *Client) {
 		}
 	}
 	m.mu.Unlock()
+
+	if m.OnClientRemoved != nil {
+		m.OnClientRemoved(id, token)
+	}
 
 	if m.OnSSEClose != nil {
 		m.OnSSEClose(id)
