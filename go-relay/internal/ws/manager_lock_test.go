@@ -53,9 +53,11 @@ func TestReconnectWaitsForDisconnectCleanup(t *testing.T) {
 
 	callbackEntered := make(chan struct{})
 	finishCallback := make(chan struct{})
-	manager.OnClientRemoved = func(string, string) {
-		close(callbackEntered)
-		<-finishCallback
+	manager.OnClientRemoved = func(id, _ string) {
+		if id == oldClient.id {
+			close(callbackEntered)
+			<-finishCallback
+		}
 	}
 
 	removed := make(chan struct{})
@@ -64,6 +66,14 @@ func TestReconnectWaitsForDisconnectCleanup(t *testing.T) {
 		close(removed)
 	}()
 	<-callbackEntered
+
+	otherServerConn, otherClientConn := testWebSocketPair(t)
+	defer otherClientConn.Close()
+	otherClient, err := manager.AddClient(otherServerConn, "client-2", "other-key", "test", "wands", "Wands", "14", "dnd5e", "D&D5e", "6", "", "")
+	if err != nil {
+		t.Fatalf("unrelated client registration blocked by disconnect cleanup: %v", err)
+	}
+	manager.RemoveClient(otherClient.id)
 
 	serverConn, clientConn := testWebSocketPair(t)
 	defer clientConn.Close()

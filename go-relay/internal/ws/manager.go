@@ -23,10 +23,10 @@ type RawMessageHandler func(client *Client, message map[string]interface{}, rawB
 
 // ClientManager manages all connected Foundry clients.
 type ClientManager struct {
-	// lifecycleMu serializes registrations with disconnect cleanup.
-	// OnClientRemoved runs outside mu to avoid lock inversion, but without this
-	// lock a same-ID reconnect could be registered before stale cleanup finishes.
+	// lifecycleMu protects lifecycleLocks, which serialize registration with
+	// disconnect cleanup per client ID.
 	lifecycleMu        sync.Mutex
+	lifecycleLocks     map[string]*clientLifecycleLock
 	mu                 sync.RWMutex
 	clients            map[string]*Client             // clientID -> Client
 	tokenGroups        map[string]map[string]bool     // apiKey -> set of clientIDs
@@ -79,15 +79,46 @@ func NewClientManager(redis *config.RedisClient, instanceID string) *ClientManag
 		tokenGroups:        make(map[string]map[string]bool),
 		messageHandlers:    make(map[string][]MessageHandler),
 		rawMessageHandlers: make(map[string][]RawMessageHandler),
+		lifecycleLocks:     make(map[string]*clientLifecycleLock),
 		redis:              redis,
 		instanceID:         instanceID,
 	}
 }
 
+type clientLifecycleLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// lockClientLifecycle returns an unlock function for serializing state changes
+// and disconnect cleanup for one ID. Reference counting keeps the lock table
+// limited to IDs with an active or waiting lifecycle operation.
+func (m *ClientManager) lockClientLifecycle(id string) func() {
+	m.lifecycleMu.Lock()
+	lock := m.lifecycleLocks[id]
+	if lock == nil {
+		lock = &clientLifecycleLock{}
+		m.lifecycleLocks[id] = lock
+	}
+	lock.refs++
+	m.lifecycleMu.Unlock()
+
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		m.lifecycleMu.Lock()
+		lock.refs--
+		if lock.refs == 0 {
+			delete(m.lifecycleLocks, id)
+		}
+		m.lifecycleMu.Unlock()
+	}
+}
+
 // AddClient registers a new Foundry client connection.
 func (m *ClientManager) AddClient(conn *websocket.Conn, id, token, tokenName, worldID, worldTitle, foundryVersion, systemID, systemTitle, systemVersion, customName, publicUrl string) (*Client, error) {
-	m.lifecycleMu.Lock()
-	defer m.lifecycleMu.Unlock()
+	unlockLifecycle := m.lockClientLifecycle(id)
+	defer unlockLifecycle()
 
 	m.mu.Lock()
 
@@ -248,8 +279,8 @@ func (m *ClientManager) LookupClientConnectionTokenID(ctx context.Context, clien
 
 // RemoveClient removes a client and cleans up state.
 func (m *ClientManager) RemoveClient(id string) {
-	m.lifecycleMu.Lock()
-	defer m.lifecycleMu.Unlock()
+	unlockLifecycle := m.lockClientLifecycle(id)
+	defer unlockLifecycle()
 
 	m.mu.Lock()
 	client, exists := m.clients[id]
@@ -320,8 +351,8 @@ func (m *ClientManager) RemoveClient(id string) {
 // connection's deferred cleanup goroutine would otherwise remove the freshly
 // registered replacement client.
 func (m *ClientManager) RemoveClientIfMatch(id string, expected *Client) {
-	m.lifecycleMu.Lock()
-	defer m.lifecycleMu.Unlock()
+	unlockLifecycle := m.lockClientLifecycle(id)
+	defer unlockLifecycle()
 
 	m.mu.Lock()
 	client, exists := m.clients[id]
